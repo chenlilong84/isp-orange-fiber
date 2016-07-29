@@ -1,0 +1,405 @@
+--- sbin/ifconfig/ifconfig.8.orig	2016-06-18 20:38:01.623572338 +0200
++++ sbin/ifconfig/ifconfig.8	2016-06-18 20:45:16.451549567 +0200
+@@ -2570,6 +2570,29 @@
+ and
+ .Cm vlandev
+ must both be set at the same time.
++.It Cm vlanpcp Ar priority_code_point
++Priority code point 
++.Pq Dv PCP
++is an 3-bit field which refers to the IEEE 802.1p
++class of service and maps to the frame priority level.
++.Pp
++Values in order of priority are:
++.Cm 1 
++.Pq Dv Background (lowest) ,
++.Cm 0
++.Pq Dv Best effort (default) ,
++.Cm 2
++.Pq Dv Excellent effort ,
++.Cm 3
++.Pq Dv Critical applications ,
++.Cm 4
++.Pq Dv Video, < 100ms latency ,
++.Cm 5
++.Pq Dv Video, < 10ms latency ,
++.Cm 6
++.Pq Dv Internetwork control ,
++.Cm 7
++.Pq Dv Network control (highest) .
+ .It Cm vlandev Ar iface
+ Associate the physical interface
+ .Ar iface
+--- sbin/ifconfig/ifvlan.c.orig	2016-06-19 00:01:41.316738508 +0200
++++ sbin/ifconfig/ifvlan.c	2016-06-19 00:21:42.018647829 +0200
+@@ -1,6 +1,10 @@
+ /*
+- * Copyright (c) 1999
+- *	Bill Paul <wpaul@ctr.columbia.edu>.  All rights reserved.
++ * Copyright (c) 1999 Bill Paul <wpaul@ctr.columbia.edu>
++ * Copyright (c) 2012 ADARA Networks, Inc.
++ * All rights reserved.
++ *
++ * Portions of this software were developed by Robert N. M. Watson under
++ * contract to ADARA Networks, Inc.
+  *
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions
+@@ -79,10 +83,14 @@
+ {
+ 	struct vlanreq		vreq;
+ 
+-	if (getvlan(s, &ifr, &vreq) != -1)
+-		printf("\tvlan: %d parent interface: %s\n",
+-		    vreq.vlr_tag, vreq.vlr_parent[0] == '\0' ?
+-		    "<none>" : vreq.vlr_parent);
++	if (getvlan(s, &ifr, &vreq) == -1)
++		return;
++	printf("\tvlan: %d", vreq.vlr_tag);
++	if (ioctl(s, SIOCGVLANPCP, (caddr_t)&ifr) != -1)
++		printf(" vlanpcp: %u", ifr.ifr_vlan_pcp);
++	printf(" parent interface: %s", vreq.vlr_parent[0] == '\0' ?
++	    "<none>" : vreq.vlr_parent);
++	printf("\n");
+ }
+ 
+ static void
+@@ -150,6 +158,22 @@
+ }
+ 
+ static
++DECL_CMD_FUNC(setvlanpcp, val, d)
++{
++	u_long ul;
++	char *endp;
++
++	ul = strtoul(val, &endp, 0);
++	if (*endp != '\0')
++		errx(1, "invalid value for vlanpcp");
++	if (ul > 7)
++		errx(1, "value for vlanpcp out of range");
++	ifr.ifr_vlan_pcp = ul;
++	if (ioctl(s, SIOCSVLANPCP, (caddr_t)&ifr) == -1)
++		err(1, "SIOCSVLANPCP");
++}
++
++static
+ DECL_CMD_FUNC(unsetvlandev, val, d)
+ {
+ 	struct vlanreq		vreq;
+@@ -170,6 +194,7 @@
+ static struct cmd vlan_cmds[] = {
+ 	DEF_CLONE_CMD_ARG("vlan",			setvlantag),
+ 	DEF_CLONE_CMD_ARG("vlandev",			setvlandev),
++	DEF_CMD_ARG("vlanpcp",				setvlanpcp),
+ 	/* NB: non-clone cmds */
+ 	DEF_CMD_ARG("vlan",				setvlantag),
+ 	DEF_CMD_ARG("vlandev",				setvlandev),
+--- share/man/man4/vlan.4.orig	2016-06-19 00:24:29.442339876 +0200
++++ share/man/man4/vlan.4	2016-06-19 00:25:05.727781252 +0200
+@@ -204,5 +204,3 @@
+ .Sh SEE ALSO
+ .Xr ifconfig 8 ,
+ .Xr sysctl 8
+-.Sh BUGS
+-No 802.1Q features except VLAN tagging are implemented.
+--- sys/net/if.h.orig	2016-06-19 00:27:53.632727272 +0200
++++ sys/net/if.h	2016-06-19 00:30:30.295707413 +0200
+@@ -392,6 +392,7 @@
+ 		caddr_t	ifru_data;
+ 		int	ifru_cap[2];
+ 		u_int	ifru_fib;
++		u_char	ifru_vlan_pcp;
+ 	} ifr_ifru;
+ #define	ifr_addr	ifr_ifru.ifru_addr	/* address */
+ #define	ifr_dstaddr	ifr_ifru.ifru_dstaddr	/* other end of p-to-p link */
+@@ -409,6 +410,7 @@
+ #define	ifr_curcap	ifr_ifru.ifru_cap[1]	/* current capabilities */
+ #define	ifr_index	ifr_ifru.ifru_index	/* interface index */
+ #define	ifr_fib		ifr_ifru.ifru_fib	/* interface fib */
++#define	ifr_vlan_pcp	ifr_ifru.ifru_vlan_pcp	/* VLAN priority */
+ };
+ 
+ #define	_SIZEOF_ADDR_IFREQ(ifr) \
+--- sys/net/if_vlan.c.orig	2016-06-19 00:33:14.767091975 +0200
++++ sys/net/if_vlan.c	2016-06-19 01:15:02.392426689 +0200
+@@ -1,5 +1,9 @@
+ /*-
+  * Copyright 1998 Massachusetts Institute of Technology
++ * Copyright 2012 ADARA Networks, Inc.
++ *
++ * Portions of this software were developed by Robert N. M. Watson under
++ * contract to ADARA Networks, Inc.
+  *
+  * Permission to use, copy, modify, and distribute this software and
+  * its documentation for any purpose and without fee is hereby
+@@ -29,8 +33,7 @@
+ 
+ /*
+  * if_vlan.c - pseudo-device driver for IEEE 802.1Q virtual LANs.
+- * Might be extended some day to also handle IEEE 802.1p priority
+- * tagging.  This is sort of sneaky in the implementation, since
++ * This is sort of sneaky in the implementation, since
+  * we need to pretend to be enough of an Ethernet implementation
+  * to make arp work.  The way we do this is by telling everyone
+  * that we are an Ethernet, and then catch the packets that
+@@ -51,6 +54,7 @@
+ #include <sys/mbuf.h>
+ #include <sys/module.h>
+ #include <sys/rwlock.h>
++#include <sys/priv.h>
+ #include <sys/queue.h>
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+@@ -112,6 +116,8 @@
+ 		int	ifvm_mintu;	/* min transmission unit */
+ 		uint16_t ifvm_proto;	/* encapsulation ethertype */
+ 		uint16_t ifvm_tag;	/* tag to apply on packets leaving if */
++		uint16_t ifvm_vid;	/* VLAN ID */
++		uint8_t  ifvm_pcp;	/* Priority Code Point (PCP). */
+ 	}	ifv_mib;
+ 	SLIST_HEAD(, vlan_mc_entry) vlan_mc_listhead;
+ #ifndef VLAN_ARRAY
+@@ -119,7 +125,9 @@
+ #endif
+ };
+ #define	ifv_proto	ifv_mib.ifvm_proto
+-#define	ifv_vid		ifv_mib.ifvm_tag
++#define	ifv_tag		ifv_mib.ifvm_tag
++#define	ifv_vid 	ifv_mib.ifvm_vid
++#define	ifv_pcp		ifv_mib.ifvm_pcp
+ #define	ifv_encaplen	ifv_mib.ifvm_encaplen
+ #define	ifv_mtufudge	ifv_mib.ifvm_mtufudge
+ #define	ifv_mintu	ifv_mib.ifvm_mintu
+@@ -144,6 +152,15 @@
+ SYSCTL_INT(_net_link_vlan, OID_AUTO, soft_pad, CTLFLAG_RW, &soft_pad, 0,
+ 	   "pad short frames before tagging");
+ 
++/*
++ * For now, make preserving PCP via an mbuf tag optional, as it increases
++ * per-packet memory allocations and frees.  In the future, it would be
++ * preferable to reuse ether_vtag for this, or similar.
++ */
++static int vlan_mtag_pcp = 0;
++SYSCTL_INT(_net_link_vlan, OID_AUTO, mtag_pcp, CTLFLAG_RW, &vlan_mtag_pcp, 0,
++	"Retain VLAN PCP information as packets are passed up the stack");
++
+ static const char vlanname[] = "vlan";
+ static MALLOC_DEFINE(M_VLAN, vlanname, "802.1Q Virtual LAN Interface");
+ 
+@@ -693,6 +710,15 @@
+ }
+ 
+ /*
++ * Recalculate the cached VLAN tag exposed via the MIB.
++ */
++static void
++vlan_tag_recalculate(struct ifvlan *ifv)
++{
++	ifv->ifv_tag = EVL_MAKETAG(ifv->ifv_vid, ifv->ifv_pcp, 0);
++}
++
++/*
+  * VLAN support can be loaded as a module.  The only place in the
+  * system that's intimately aware of this is ether_input.  We hook
+  * into this code through vlan_input_p which is defined there and
+@@ -1026,6 +1052,8 @@
+ {
+ 	struct ifvlan *ifv;
+ 	struct ifnet *p;
++	struct m_tag *mtag;
++	uint16_t tag;
+ 	int error, len, mcast;
+ 
+ 	ifv = ifp->if_softc;
+@@ -1081,11 +1109,16 @@
+ 	 * knows how to find the VLAN tag to use, so we attach a
+ 	 * packet tag that holds it.
+ 	 */
++	if (vlan_mtag_pcp && (mtag = m_tag_locate(m, MTAG_8021Q,
++	    MTAG_8021Q_PCP_OUT, NULL)) != NULL)
++		tag = EVL_MAKETAG(ifv->ifv_vid, *(uint8_t *)(mtag + 1), 0);
++	else
++		tag = ifv->ifv_tag;
+ 	if (p->if_capenable & IFCAP_VLAN_HWTAGGING) {
+-		m->m_pkthdr.ether_vtag = ifv->ifv_vid;
++		m->m_pkthdr.ether_vtag = tag;
+ 		m->m_flags |= M_VLANTAG;
+ 	} else {
+-		m = ether_vlanencap(m, ifv->ifv_vid);
++		m = ether_vlanencap(m, tag);
+ 		if (m == NULL) {
+ 			if_printf(ifp, "unable to prepend VLAN header\n");
+ 			ifp->if_oerrors++;
+@@ -1119,7 +1152,8 @@
+ {
+ 	struct ifvlantrunk *trunk = ifp->if_vlantrunk;
+ 	struct ifvlan *ifv;
+-	uint16_t vid;
++	struct m_tag *mtag;
++	uint16_t vid, tag;
+ 
+ 	KASSERT(trunk != NULL, ("%s: no trunk", __func__));
+ 
+@@ -1128,7 +1162,7 @@
+ 		 * Packet is tagged, but m contains a normal
+ 		 * Ethernet frame; the tag is stored out-of-band.
+ 		 */
+-		vid = EVL_VLANOFTAG(m->m_pkthdr.ether_vtag);
++		tag = m->m_pkthdr.ether_vtag;
+ 		m->m_flags &= ~M_VLANTAG;
+ 	} else {
+ 		struct ether_vlan_header *evl;
+@@ -1144,7 +1178,7 @@
+ 				return;
+ 			}
+ 			evl = mtod(m, struct ether_vlan_header *);
+-			vid = EVL_VLANOFTAG(ntohs(evl->evl_tag));
++			tag = ntohs(evl->evl_tag);
+ 
+ 			/*
+ 			 * Remove the 802.1q header by copying the Ethernet
+@@ -1168,6 +1202,8 @@
+ 		}
+ 	}
+ 
++	vid = EVL_VLANOFTAG(tag);
++
+ 	TRUNK_RLOCK(trunk);
+ 	ifv = vlan_gethash(trunk, vid);
+ 	if (ifv == NULL || !UP_AND_RUNNING(ifv->ifv_ifp)) {
+@@ -1178,6 +1214,28 @@
+ 	}
+ 	TRUNK_RUNLOCK(trunk);
+ 
++	if (vlan_mtag_pcp) {
++		/*
++		 * While uncommon, it is possible that we will find a 802.1q
++		 * packet encapsulated inside another packet that also had an
++		 * 802.1q header.  For example, ethernet tunneled over IPSEC
++		 * arriving over ethernet.  In that case, we replace the
++		 * existing 802.1q PCP m_tag value.
++		 */
++		mtag = m_tag_locate(m, MTAG_8021Q, MTAG_8021Q_PCP_IN, NULL);
++		if (mtag == NULL) {
++			mtag = m_tag_alloc(MTAG_8021Q, MTAG_8021Q_PCP_IN,
++			       sizeof(uint8_t), M_NOWAIT);
++			if (mtag == NULL) {
++				m_freem(m);
++				if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
++				return;
++			}
++			m_tag_prepend(m, mtag);
++		}
++		*(uint8_t *)(mtag + 1) = EVL_PRIOFTAG(tag);
++	}
++
+ 	m->m_pkthdr.rcvif = ifv->ifv_ifp;
+ 	ifv->ifv_ifp->if_ipackets++;
+ 
+@@ -1209,7 +1267,7 @@
+ 		vlan_inithash(trunk);
+ 		VLAN_LOCK();
+ 		if (p->if_vlantrunk != NULL) {
+-			/* A race that that is very unlikely to be hit. */
++			/* A race that is very unlikely to be hit. */
+ 			vlan_freehash(trunk);
+ 			free(trunk, M_VLAN);
+ 			goto exists;
+@@ -1226,6 +1284,8 @@
+ 	}
+ 
+ 	ifv->ifv_vid = vid;	/* must set this before vlan_inshash() */
++	ifv->ifv_pcp = 0;       /* Default: best effort delivery. */
++	vlan_tag_recalculate(ifv);
+ 	error = vlan_inshash(trunk, ifv);
+ 	if (error)
+ 		goto done;
+@@ -1721,6 +1781,34 @@
+ 		}
+ 		break;
+ 
++	case SIOCGVLANPCP:
++#ifdef VIMAGE
++		if (ifp->if_vnet != ifp->if_home_vnet) {
++			error = EPERM;
++			break;
++		}
++#endif
++		ifr->ifr_vlan_pcp = ifv->ifv_pcp;
++		break;
++
++	case SIOCSVLANPCP:
++#ifdef VIMAGE
++		if (ifp->if_vnet != ifp->if_home_vnet) {
++			error = EPERM;
++			break;
++		}
++#endif
++		error = priv_check(curthread, PRIV_NET_SETVLANPCP);
++		if (error)
++			break;
++		if (ifr->ifr_vlan_pcp > 7) {
++			error = EINVAL;
++			break;
++		}
++		ifv->ifv_pcp = ifr->ifr_vlan_pcp;
++		vlan_tag_recalculate(ifv);
++		break;
++
+ 	default:
+ 		error = EINVAL;
+ 		break;
+--- sys/net/if_vlan_var.h.orig	2016-06-19 12:30:58.743629354 +0200
++++ sys/net/if_vlan_var.h	2016-06-19 12:33:59.270617560 +0200
+@@ -89,6 +89,23 @@
+ #define	SIOCSETVLAN	SIOCSIFGENERIC
+ #define	SIOCGETVLAN	SIOCGIFGENERIC
+ 
++#define	SIOCGVLANPCP	_IOWR('i', 152, struct ifreq)	/* Get VLAN PCP */
++#define	SIOCSVLANPCP	 _IOW('i', 153, struct ifreq)	/* Set VLAN PCP */
++
++/*
++ * Names for 802.1q priorities ("802.1p").  Notice that in this scheme,
++ * (0 < 1), allowing default 0-tagged traffic to take priority over background
++ * tagged traffic.
++ */
++#define	IEEE8021Q_PCP_BK	1	/* Background (lowest) */
++#define	IEEE8021Q_PCP_BE	0	/* Best effort (default) */
++#define	IEEE8021Q_PCP_EE	2	/* Excellent effort */
++#define	IEEE8021Q_PCP_CA	3	/* Critical applications */
++#define	IEEE8021Q_PCP_VI	4	/* Video, < 100ms latency */
++#define	IEEE8021Q_PCP_VO	5	/* Video, < 10ms latency */
++#define	IEEE8021Q_PCP_IC	6	/* Internetwork control */
++#define	IEEE8021Q_PCP_NC	7	/* Network control (highest) */
++
+ #ifdef _KERNEL
+ /*
+  * Drivers that are capable of adding and removing the VLAN header
+@@ -126,6 +143,16 @@
+  * if_capabilities.
+  */
+ 
++/*
++ * The 802.1q code may also tag mbufs with the PCP (priority) field for use in
++ * other layers of the stack, in which case an m_tag will be used.  This is
++ * semantically quite different from use of the ether_vtag field, which is
++ * defined only between the device driver and VLAN layer.
++ */
++#define	MTAG_8021Q		1326104895
++#define	MTAG_8021Q_PCP_IN	0		/* Input priority. */
++#define	MTAG_8021Q_PCP_OUT	1		/* Output priority. */
++
+ #define	VLAN_CAPABILITIES(_ifp) do {				\
+ 	if ((_ifp)->if_vlantrunk != NULL) 			\
+ 		(*vlan_trunk_cap_p)(_ifp);			\
+--- sys/sys/priv.h.orig	2016-06-19 12:35:25.518259230 +0200
++++ sys/sys/priv.h	2016-06-19 12:36:08.064611350 +0200
+@@ -341,6 +341,7 @@
+ #define	PRIV_NET_SETIFDESCR	418	/* Set interface description. */
+ #define	PRIV_NET_SETIFFIB	419	/* Set interface fib. */
+ #define	PRIV_NET_VXLAN		420	/* Administer vxlan. */
++#define	PRIV_NET_SETVLANPCP	421	/* Set VLAN priority. */
+ 
+ /*
+  * 802.11-related privileges.
